@@ -37,6 +37,12 @@ def parse_transaction_line(line: str):
     #   1) Date token at the start, like 13MAY
     #   2) Description that must contain 'CR DIVIDENDS FOR ...'
     #   3) Two monetary values at the end: amount then balance
+    #   Group 1: (\d{2}[A-Z]{3}) where \d{2} → exactly two digits (day) and [A-Z]{3} → exactly three uppercase letters (month code)
+    #   \s+ means Requires one or more spaces
+    #   Group 2: (CR DIVIDENDS FOR\s+.+?) captures the description where .+? A short as possible (non-greedy) match of anything, representing the stock name or code
+    #   Group 3: ([0-9,]+\.\d{2}) captures [0-9,]+ → digits or commas (thousand separators), \. for literal decimal point and \d{2} → exactly two decimals
+    #   Group 4: ([0-9,]+\.\d{2}) captures the Balance after credit in the PDF
+
     m = re.match(
         r"^(\d{2}[A-Z]{3})\s+(CR DIVIDENDS FOR\s+.+?)\s+([0-9,]+\.\d{2})\s+([0-9,]+\.\d{2})\s*$",
         line,
@@ -59,7 +65,7 @@ def parse_transaction_line(line: str):
     day = date_raw[:2]
     mon = month_map.get(date_raw[2:5], date_raw[2:5])
     #IMPORTANT: The year is fixed to 2024. Change this if the year is different.
-    date = f"{day}-{mon}-24"
+    date = f"{day}-{mon}-25"
 
     # For dividend rows, amount is always a credit
     return {
