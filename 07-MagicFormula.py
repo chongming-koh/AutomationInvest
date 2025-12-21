@@ -9,6 +9,17 @@ def extract_ticker_from_filename(name: str) -> str:
         raise ValueError(f"Could not extract ticker from filename: {name}")
     return m.group(1).upper()
 
+# UPDATED: Some TIKR filenames end with a 3-letter currency code, e.g. '-USD.xlsx' or '-CNY.xlsx'
+def extract_ccy_from_filename(name: str) -> str | None:
+    m = re.search(
+        r"[\u2010\u2011\u2012\u2013\u2014\u2212\-]\s*([A-Z]{3})\s*\.xlsx$",
+        name,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None
+    return m.group(1).upper()
+
 def _norm(s: str) -> str:
     s = str(s).strip().lower()
     s = re.sub(r"[\u2010\u2011\u2012\u2013\u2014\u2212\-]", " ", s)  # hyphen variants
@@ -76,6 +87,45 @@ if not MARKETCAP_PATH.exists():
 
 # ---------- Load Market Cap file ----------
 mc = pd.read_excel(MARKETCAP_PATH)
+
+# Update for CCY calculation: SGD -> CCY FX rates (multiplier)
+# - Keep these rates here so you can update them easily when needed.
+SGD_TO_CCY_RATES: dict[str, float] = {
+    "MYR": 3.15,
+    "USD": 0.77,
+    "IDR": 12907.94,
+    "THB": 24.27,
+    "CNY": 5.43,
+    "EUR": 0.66,
+    "HKD": 6.00,
+}
+
+
+def market_cap_sgd_to_ccy_millions(mkt_cap_sgd: float | int | None, ccy: str | None) -> float | None:
+    """Convert a SGD market cap value to CCY (if provided) and return in millions."""
+    if mkt_cap_sgd is None:
+        return None
+
+    amt = pd.to_numeric(mkt_cap_sgd, errors="coerce")
+    if pd.isna(amt):
+        return None
+
+        # Update for CCY calculation: if CCY is empty/NaN, keep market cap in SGD.
+    if ccy is None or pd.isna(ccy) or str(ccy).strip() == "":
+        # No CCY suffix in filename (or missing CCY), keep market cap in SGD.
+        return float(amt) / 1_000_000
+
+    ccy_u = str(ccy).strip().upper()
+    if ccy_u not in SGD_TO_CCY_RATES:
+        msg = (
+            f"Update for CCY calculation: Missing SGD-> {ccy_u} rate. "
+            "Please update SGD_TO_CCY_RATES in the script."
+        )
+        print(msg)
+        raise ValueError(msg)
+
+    return (float(amt) * SGD_TO_CCY_RATES[ccy_u]) / 1_000_000
+
 ticker_col = next((c for c in mc.columns if _norm(c) in {"ticker", "tickers"}), None)
 company_col = next((c for c in mc.columns if _norm(c) in {"company name", "company"}), None)
 if ticker_col is None or company_col is None:
@@ -88,14 +138,16 @@ if mkt_cap_col is None:
 
 marketcap_value_col = mkt_cap_col
 
-# UPDATED: Convert "Mkt Cap" column to millions once at source
-mc[marketcap_value_col] = pd.to_numeric(mc[marketcap_value_col], errors="coerce").fillna(0) / 1_000_000
+# Update for CCY calculation: keep Market Cap as raw SGD in the lookup.
+# Conversion to CCY (and to millions) is done per-row based on the file's CCY suffix.
+mc[marketcap_value_col] = pd.to_numeric(mc[marketcap_value_col], errors="coerce")
 mc_lookup = mc.copy()
 mc_lookup[ticker_col] = mc_lookup[ticker_col].astype(str).str.strip().str.upper()
 mc_lookup = mc_lookup.set_index(ticker_col)
 
 # ---------- Process TIKR financial files ----------
-tikr_files = sorted(TIKR_DIR.glob("TIKR - * - Financials (*.xlsx"))
+#tikr_files = sorted(TIKR_DIR.glob("TIKR - * - Financials (*.xlsx"))
+tikr_files = sorted(TIKR_DIR.glob("TIKR - * - Financials*.xlsx"))
 
 print("Picked up these TIKR files:") # UPDATED
 for p in tikr_files: # UPDATED
@@ -108,15 +160,23 @@ rows = []
 for fpath in tikr_files:
     ticker = extract_ticker_from_filename(fpath.name)
 
+    # UPDATED: Extract optional 3-letter currency code suffix from filename (if present)
+    ccy = extract_ccy_from_filename(fpath.name)    
     company_name = None
     market_cap = None
+    raw_market_cap_sgd = None
     if ticker in mc_lookup.index:
         company_name = mc_lookup.at[ticker, company_col]
-        market_cap = mc_lookup.at[ticker, marketcap_value_col]
+        raw_market_cap_sgd = mc_lookup.at[ticker, marketcap_value_col]
+
     if isinstance(company_name, pd.Series):
         company_name = company_name.iloc[0]
-    if isinstance(market_cap, pd.Series):
-        market_cap = market_cap.iloc[0]
+    if isinstance(raw_market_cap_sgd, pd.Series):
+        raw_market_cap_sgd = raw_market_cap_sgd.iloc[0]
+
+    # Update for CCY calculation: convert raw SGD market cap into the row CCY (if any), then to millions.
+    if raw_market_cap_sgd is not None:
+        market_cap = market_cap_sgd_to_ccy_millions(raw_market_cap_sgd, ccy)
 
     # Income Statement
     inc = pd.read_excel(fpath, sheet_name="Income Statement", header=None)
@@ -140,6 +200,7 @@ for fpath in tikr_files:
     rows.append({
         "Ticker codes": ticker,
         "Company Name": company_name,
+        "CCY": ccy,  # UPDATED
         "Operating Income": operating_income,
         "Market Cap": market_cap,
         "Current Debt": current_debt,
@@ -152,20 +213,24 @@ for fpath in tikr_files:
         "Return on Capital": None,
     })
 
-df = pd.DataFrame(rows, columns=[
-    "Ticker codes",
-    "Company Name",
-    "Operating Income",
-    "Market Cap",
-    "Current Debt",
-    "Long Term Debt",
-    "Total Current Assets",
-    "Total Current Liabilities",
-    "Enterprise Value",
-    "Net Property Plant Equipment",
-    "Earning Yield",
-    "Return on Capital",
-])
+df = pd.DataFrame(
+    rows,
+    columns=[
+        "Ticker codes",
+        "Company Name",
+        "CCY",  # UPDATED
+        "Operating Income",
+        "Market Cap",
+        "Current Debt",
+        "Long Term Debt",
+        "Total Current Assets",
+        "Total Current Liabilities",
+        "Enterprise Value",
+        "Net Property Plant Equipment",
+        "Earning Yield",
+        "Return on Capital",
+    ],
+)
 
 # UPDATED (Step 1-5): calculations for Enterprise Value, Earning Yield, Return on Capital
 # Step 2: fill empty numeric cells with 0 to avoid calculation issues
